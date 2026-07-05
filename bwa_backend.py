@@ -12,9 +12,11 @@ from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
 from dotenv import load_dotenv
+import time
+import requests
+from typing import Any
 
 load_dotenv()
 
@@ -111,9 +113,190 @@ class State(TypedDict):
 
 
 # -----------------------------
-# 2) LLM
+# 2) LLM and Free API Wrappers
 # -----------------------------
-llm = ChatOpenAI(model="gpt-4.1-mini")
+class HuggingFaceChatModel:
+    def __init__(self, model_id: str = "meta-llama/Llama-3.3-70B-Instruct", api_key: str = None):
+        self.model_id = model_id
+        self.api_key = api_key or os.getenv("HUGGINGFACE_API_KEY") or os.getenv("HF_TOKEN")
+        if not self.api_key:
+            raise ValueError(
+                "No Hugging Face API key found. Please set HUGGINGFACE_API_KEY or HF_TOKEN "
+                "in your environment or .env file to run with free APIs."
+            )
+            
+    def _convert_messages(self, messages: list) -> list:
+        formatted = []
+        for m in messages:
+            if isinstance(m, SystemMessage):
+                formatted.append({"role": "system", "content": m.content})
+            elif isinstance(m, HumanMessage):
+                formatted.append({"role": "user", "content": m.content})
+            elif isinstance(m, AIMessage):
+                formatted.append({"role": "assistant", "content": m.content})
+            elif isinstance(m, dict):
+                formatted.append(m)
+            else:
+                formatted.append({"role": "user", "content": str(m)})
+        return formatted
+
+    def invoke(self, messages: list, temperature: float = 0.7, max_tokens: int = 2048) -> AIMessage:
+        formatted_messages = self._convert_messages(messages)
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        url = f"https://api-inference.huggingface.co/models/{self.model_id}/v1/chat/completions"
+        payload = {
+            "model": self.model_id,
+            "messages": formatted_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        }
+        
+        max_retries = 5
+        retry_delay = 5.0
+        
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=60)
+                if response.status_code == 503:
+                    est_time = response.json().get("estimated_time", 15.0)
+                    sleep_time = min(max(est_time, 5.0), 30.0)
+                    print(f"Hugging Face model '{self.model_id}' is loading. Retrying in {sleep_time} seconds (attempt {attempt+1}/{max_retries})...")
+                    time.sleep(sleep_time)
+                    continue
+                if response.status_code == 429:
+                    print(f"Hugging Face API rate limit reached. Retrying in {retry_delay} seconds (attempt {attempt+1}/{max_retries})...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2.0
+                    continue
+                response.raise_for_status()
+                content = response.json()["choices"][0]["message"]["content"]
+                return AIMessage(content=content)
+            except requests.exceptions.RequestException as e:
+                if attempt == max_retries - 1:
+                    raise RuntimeError(f"Hugging Face API request failed after {max_retries} attempts: {e}")
+                time.sleep(2.0)
+                
+        raise RuntimeError(f"Failed to get response from Hugging Face model {self.model_id}.")
+
+    def with_structured_output(self, schema):
+        return HuggingFaceStructuredOutputWrapper(self, schema)
+
+
+class HuggingFaceStructuredOutputWrapper:
+    def __init__(self, model: HuggingFaceChatModel, schema):
+        self.model = model
+        self.schema = schema
+
+    def invoke(self, messages: list) -> Any:
+        try:
+            if hasattr(self.schema, "model_json_schema"):
+                schema_json = json.dumps(self.schema.model_json_schema(), indent=2)
+            else:
+                schema_json = json.dumps(self.schema.schema(), indent=2)
+        except Exception:
+            schema_json = str(self.schema)
+
+        json_instruction = (
+            f"\n\nCRITICAL REQUIREMENT:\n"
+            f"You MUST respond ONLY with a raw JSON object matching the JSON schema below.\n"
+            f"Do not write any preamble, explanation, introduction, or notes. Do not include any HTML.\n"
+            f"You MUST wrap your JSON output in a Markdown code block like this:\n"
+            f"```json\n"
+            f"{{\n"
+            f"  ...\n"
+            f"}}\n"
+            f"```\n"
+            f"Ensure your output is perfectly formatted JSON. Here is the JSON Schema:\n{schema_json}"
+        )
+
+        updated_messages = []
+        has_system = False
+        for m in messages:
+            if isinstance(m, SystemMessage):
+                updated_messages.append(SystemMessage(content=m.content + json_instruction))
+                has_system = True
+            elif isinstance(m, HumanMessage):
+                updated_messages.append(HumanMessage(content=m.content))
+            elif isinstance(m, AIMessage):
+                updated_messages.append(AIMessage(content=m.content))
+            else:
+                updated_messages.append(m)
+
+        if not has_system:
+            updated_messages.insert(0, SystemMessage(content=json_instruction))
+
+        response = self.model.invoke(updated_messages, temperature=0.1, max_tokens=4096)
+        content = response.content.strip()
+        parsed_json = self._extract_and_parse_json(content)
+
+        try:
+            if hasattr(self.schema, "model_validate"):
+                return self.schema.model_validate(parsed_json)
+            else:
+                return self.schema.parse_obj(parsed_json)
+        except Exception as e:
+            raise ValueError(
+                f"JSON validation failed for schema {self.schema.__name__}: {e}.\n"
+                f"Model response was:\n{content}\n"
+                f"Parsed JSON:\n{json.dumps(parsed_json, indent=2)}"
+            )
+
+    def _extract_and_parse_json(self, text: str) -> dict:
+        match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
+        if match:
+            json_str = match.group(1).strip()
+        else:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1:
+                json_str = text[start:end+1].strip()
+            else:
+                json_str = text.strip()
+
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError as e:
+            cleaned = json_str
+            cleaned = re.sub(r"\bTrue\b", "true", cleaned)
+            cleaned = re.sub(r"\bFalse\b", "false", cleaned)
+            cleaned = re.sub(r"\bNone\b", "null", cleaned)
+            cleaned = re.sub(r",\s*([\]}])", r"\1", cleaned)
+            try:
+                return json.loads(cleaned)
+            except json.JSONDecodeError:
+                raise ValueError(
+                    f"Failed to parse text as JSON. Raw model text:\n{text}\n"
+                    f"Attempted to parse clean text:\n{json_str}\nError: {e}"
+                )
+
+
+def _get_llm():
+    # 1. Check OpenAI
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if openai_key:
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(model="gpt-4o-mini", api_key=openai_key)
+        
+    # 2. Check Google/Gemini
+    google_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if google_key:
+        from langchain_google_genai import ChatGoogleGenAI
+        os.environ["GOOGLE_API_KEY"] = google_key
+        return ChatGoogleGenAI(model="gemini-2.5-flash")
+        
+    # 3. Check Hugging Face (Free default)
+    hf_key = os.getenv("HUGGINGFACE_API_KEY") or os.getenv("HF_TOKEN")
+    if hf_key:
+        model_id = os.getenv("HUGGINGFACE_MODEL", "meta-llama/Llama-3.3-70B-Instruct")
+        return HuggingFaceChatModel(model_id=model_id, api_key=hf_key)
+        
+    raise ValueError(
+        "No AI API keys configured. You must set HUGGINGFACE_API_KEY in your .env file "
+        "to run the application for free, or configure OPENAI_API_KEY / GOOGLE_API_KEY."
+    )
 
 # -----------------------------
 # 3) Router
@@ -133,6 +316,7 @@ If needs_research=true:
 """
 
 def router_node(state: State) -> dict:
+    llm = _get_llm()
     decider = llm.with_structured_output(RouterDecision)
     decision = decider.invoke(
         [
@@ -162,25 +346,47 @@ def route_next(state: State) -> str:
 # 4) Research (Tavily)
 # -----------------------------
 def _tavily_search(query: str, max_results: int = 5) -> List[dict]:
-    if not os.getenv("TAVILY_API_KEY"):
-        return []
+    # Check for Tavily API Key
+    tavily_key = os.getenv("TAVILY_API_KEY")
+    if tavily_key:
+        try:
+            from langchain_community.tools.tavily_search import TavilySearchResults  # type: ignore
+            tool = TavilySearchResults(max_results=max_results)
+            results = tool.invoke({"query": query})
+            out: List[dict] = []
+            for r in results or []:
+                out.append(
+                    {
+                        "title": r.get("title") or "",
+                        "url": r.get("url") or "",
+                        "snippet": r.get("content") or r.get("snippet") or "",
+                        "published_at": r.get("published_date") or r.get("published_at"),
+                        "source": r.get("source") or "tavily",
+                    }
+                )
+            return out
+        except Exception as e:
+            print(f"Tavily search failed, falling back to DuckDuckGo: {e}")
+            
+    # DuckDuckGo Search Fallback
     try:
-        from langchain_community.tools.tavily_search import TavilySearchResults  # type: ignore
-        tool = TavilySearchResults(max_results=max_results)
-        results = tool.invoke({"query": query})
+        from duckduckgo_search import DDGS
         out: List[dict] = []
-        for r in results or []:
-            out.append(
-                {
-                    "title": r.get("title") or "",
-                    "url": r.get("url") or "",
-                    "snippet": r.get("content") or r.get("snippet") or "",
-                    "published_at": r.get("published_date") or r.get("published_at"),
-                    "source": r.get("source"),
-                }
-            )
-        return out
-    except Exception:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+            for r in results:
+                out.append(
+                    {
+                        "title": r.get("title") or "",
+                        "url": r.get("href") or "",
+                        "snippet": r.get("body") or "",
+                        "published_at": None,
+                        "source": "duckduckgo",
+                    }
+                )
+            return out
+    except Exception as e:
+        print(f"DuckDuckGo search failed: {e}")
         return []
 
 def _iso_to_date(s: Optional[str]) -> Optional[date]:
@@ -212,6 +418,7 @@ def research_node(state: State) -> dict:
     if not raw:
         return {"evidence": []}
 
+    llm = _get_llm()
     extractor = llm.with_structured_output(EvidencePack)
     pack = extractor.invoke(
         [
@@ -261,6 +468,7 @@ Output must match Plan schema.
 """
 
 def orchestrator_node(state: State) -> dict:
+    llm = _get_llm()
     planner = llm.with_structured_output(Plan)
     mode = state.get("mode", "closed_book")
     evidence = state.get("evidence", [])
@@ -344,6 +552,7 @@ def worker_node(payload: dict) -> dict:
         for e in evidence[:20]
     )
 
+    llm = _get_llm()
     section_md = llm.invoke(
         [
             SystemMessage(content=WORKER_SYSTEM),
@@ -400,6 +609,7 @@ Return strictly GlobalImagePlan.
 """
 
 def decide_images(state: State) -> dict:
+    llm = _get_llm()
     planner = llm.with_structured_output(GlobalImagePlan)
     merged_md = state["merged_md"]
     plan = state["plan"]
@@ -427,50 +637,78 @@ def decide_images(state: State) -> dict:
 
 def _gemini_generate_image_bytes(prompt: str) -> bytes:
     """
-    Returns raw image bytes generated by Gemini.
-    Requires: pip install google-genai
-    Env var: GOOGLE_API_KEY
+    Returns raw image bytes generated by a Hugging Face text-to-image model.
+    Falls back to Google Gemini if HUGGINGFACE_API_KEY is not set.
     """
-    from google import genai
-    from google.genai import types
+    hf_key = os.environ.get("HUGGINGFACE_API_KEY") or os.environ.get("HF_TOKEN")
+    if hf_key:
+        model_id = os.environ.get("HUGGINGFACE_IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")
+        headers = {
+            "Authorization": f"Bearer {hf_key}",
+            "Content-Type": "application/json"
+        }
+        url = f"https://api-inference.huggingface.co/models/{model_id}"
+        
+        max_retries = 3
+        retry_delay = 5.0
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(url, headers=headers, json={"inputs": prompt}, timeout=120)
+                if response.status_code == 503:
+                    est_time = response.json().get("estimated_time", 15.0)
+                    sleep_time = min(max(est_time, 5.0), 30.0)
+                    print(f"Hugging Face image model is loading. Retrying in {sleep_time} seconds (attempt {attempt+1}/{max_retries})...")
+                    time.sleep(sleep_time)
+                    continue
+                if response.status_code == 429:
+                    print(f"Hugging Face API rate limit reached. Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    continue
+                response.raise_for_status()
+                return response.content
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise RuntimeError(f"Hugging Face image generation failed after {max_retries} attempts: {e}")
+                time.sleep(retry_delay)
+                
+    # Fallback to Google Gemini
+    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    if api_key:
+        from google import genai
+        from google.genai import types
 
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY is not set.")
+        client = genai.Client(api_key=api_key)
 
-    client = genai.Client(api_key=api_key)
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash-image",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_modalities=["IMAGE"],
+                safety_settings=[
+                    types.SafetySetting(
+                        category="HARM_CATEGORY_DANGEROUS_CONTENT",
+                        threshold="BLOCK_ONLY_HIGH",
+                    )
+                ],
+            ),
+        )
 
-    resp = client.models.generate_content(
-        model="gemini-2.5-flash-image",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE"],
-            safety_settings=[
-                types.SafetySetting(
-                    category="HARM_CATEGORY_DANGEROUS_CONTENT",
-                    threshold="BLOCK_ONLY_HIGH",
-                )
-            ],
-        ),
-    )
+        parts = getattr(resp, "parts", None)
+        if not parts and getattr(resp, "candidates", None):
+            try:
+                parts = resp.candidates[0].content.parts
+            except Exception:
+                parts = None
 
-    # Depending on SDK version, parts may hang off resp.candidates[0].content.parts
-    parts = getattr(resp, "parts", None)
-    if not parts and getattr(resp, "candidates", None):
-        try:
-            parts = resp.candidates[0].content.parts
-        except Exception:
-            parts = None
+        if not parts:
+            raise RuntimeError("No image content returned from Gemini (safety/quota/SDK change).")
 
-    if not parts:
-        raise RuntimeError("No image content returned (safety/quota/SDK change).")
+        for part in parts:
+            inline = getattr(part, "inline_data", None)
+            if inline and getattr(inline, "data", None):
+                return inline.data
 
-    for part in parts:
-        inline = getattr(part, "inline_data", None)
-        if inline and getattr(inline, "data", None):
-            return inline.data
-
-    raise RuntimeError("No inline image bytes found in response.")
+    raise RuntimeError("No valid API keys (HUGGINGFACE_API_KEY or GOOGLE_API_KEY) found for image generation.")
 
 
 def _safe_slug(title: str) -> str:
