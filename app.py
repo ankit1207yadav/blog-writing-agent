@@ -343,8 +343,16 @@ with st.sidebar:
     tavily_key = os.getenv("TAVILY_API_KEY")
     openai_key = os.getenv("OPENAI_API_KEY")
     google_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    groq_key = os.getenv("GROQ_API_KEY")
+    grok_key = os.getenv("GROK_API_KEY") or os.getenv("XAI_API_KEY")
 
-    if hf_key:
+    if groq_key:
+        st.markdown(f'<div class="status-badge status-active">🤖 Groq API: Connected (Free)</div>', unsafe_allow_html=True)
+        st.caption(f"LLM Model: `{os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')}`")
+    elif grok_key:
+        st.markdown(f'<div class="status-badge status-active">🤖 Grok API: Connected</div>', unsafe_allow_html=True)
+        st.caption(f"LLM Model: `{os.getenv('GROK_MODEL', 'grok-2-1212')}`")
+    elif hf_key:
         st.markdown(f'<div class="status-badge status-active">🤖 Hugging Face API: Connected</div>', unsafe_allow_html=True)
         st.caption(f"LLM Model: `{os.getenv('HUGGINGFACE_MODEL', 'meta-llama/Llama-3.3-70B-Instruct')}`")
         st.caption(f"Image Model: `{os.getenv('HUGGINGFACE_IMAGE_MODEL', 'black-forest-labs/FLUX.1-schnell')}`")
@@ -356,7 +364,7 @@ with st.sidebar:
         st.caption("LLM Model: `gemini-2.5-flash`")
     else:
         st.markdown('<div class="status-badge status-inactive">⚠️ No LLM Key Configured</div>', unsafe_allow_html=True)
-        st.caption("Please add HUGGINGFACE_API_KEY in your .env file to run completely for free.")
+        st.caption("Please add GROQ_API_KEY or HUGGINGFACE_API_KEY in your .env file to run.")
 
     if tavily_key:
         st.markdown('<div class="status-badge status-active">🔎 Tavily Search: Connected</div>', unsafe_allow_html=True)
@@ -449,11 +457,11 @@ if run_btn:
         st.warning("Please specify a topic or prompt for generation.")
         st.stop()
         
-    if not hf_key and not openai_key and not google_key:
+    if not hf_key and not openai_key and not google_key and not groq_key and not grok_key:
         st.error(
             "Configuration Error: No active API keys detected for the LLM. "
-            "Please create a `.env` file in the project folder and define `HUGGINGFACE_API_KEY` "
-            "to run using Hugging Face's free serverless inference API tier."
+            "Please create a `.env` file in the project folder and define `GROQ_API_KEY` "
+            "or `HUGGINGFACE_API_KEY` to run using free API tiers."
         )
         st.stop()
 

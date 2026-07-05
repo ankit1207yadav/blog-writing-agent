@@ -274,28 +274,50 @@ class HuggingFaceStructuredOutputWrapper:
 
 
 def _get_llm():
-    # 1. Check OpenAI
+    # 1. Check Groq
+    groq_key = os.getenv("GROQ_API_KEY")
+    if groq_key:
+        from langchain_openai import ChatOpenAI
+        model_id = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        return ChatOpenAI(
+            model=model_id,
+            api_key=groq_key,
+            base_url="https://api.groq.com/openai/v1"
+        )
+        
+    # 2. Check Grok (xAI)
+    grok_key = os.getenv("GROK_API_KEY") or os.getenv("XAI_API_KEY")
+    if grok_key:
+        from langchain_openai import ChatOpenAI
+        model_id = os.getenv("GROK_MODEL", "grok-2-1212")
+        return ChatOpenAI(
+            model=model_id,
+            api_key=grok_key,
+            base_url="https://api.x.ai/v1"
+        )
+
+    # 3. Check OpenAI
     openai_key = os.getenv("OPENAI_API_KEY")
     if openai_key:
         from langchain_openai import ChatOpenAI
         return ChatOpenAI(model="gpt-4o-mini", api_key=openai_key)
         
-    # 2. Check Google/Gemini
+    # 4. Check Google/Gemini
     google_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
     if google_key:
         from langchain_google_genai import ChatGoogleGenAI
         os.environ["GOOGLE_API_KEY"] = google_key
         return ChatGoogleGenAI(model="gemini-2.5-flash")
         
-    # 3. Check Hugging Face (Free default)
+    # 5. Check Hugging Face (Free default)
     hf_key = os.getenv("HUGGINGFACE_API_KEY") or os.getenv("HF_TOKEN")
     if hf_key:
         model_id = os.getenv("HUGGINGFACE_MODEL", "meta-llama/Llama-3.3-70B-Instruct")
         return HuggingFaceChatModel(model_id=model_id, api_key=hf_key)
         
     raise ValueError(
-        "No AI API keys configured. You must set HUGGINGFACE_API_KEY in your .env file "
-        "to run the application for free, or configure OPENAI_API_KEY / GOOGLE_API_KEY."
+        "No AI API keys configured. You must set GROQ_API_KEY, HUGGINGFACE_API_KEY, "
+        "OPENAI_API_KEY, or GOOGLE_API_KEY in your .env file."
     )
 
 # -----------------------------
