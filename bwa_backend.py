@@ -273,14 +273,25 @@ class HuggingFaceStructuredOutputWrapper:
                 )
 
 
+class OpenAICompatibleChatModel:
+    def __init__(self, model_id: str, api_key: str, base_url: str):
+        from langchain_openai import ChatOpenAI
+        self.llm = ChatOpenAI(model=model_id, api_key=api_key, base_url=base_url)
+        
+    def invoke(self, messages: list, **kwargs) -> Any:
+        return self.llm.invoke(messages, **kwargs)
+        
+    def with_structured_output(self, schema):
+        return HuggingFaceStructuredOutputWrapper(self, schema)
+
+
 def _get_llm():
     # 1. Check Groq
     groq_key = os.getenv("GROQ_API_KEY")
     if groq_key:
-        from langchain_openai import ChatOpenAI
         model_id = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-        return ChatOpenAI(
-            model=model_id,
+        return OpenAICompatibleChatModel(
+            model_id=model_id,
             api_key=groq_key,
             base_url="https://api.groq.com/openai/v1"
         )
@@ -288,10 +299,9 @@ def _get_llm():
     # 2. Check Grok (xAI)
     grok_key = os.getenv("GROK_API_KEY") or os.getenv("XAI_API_KEY")
     if grok_key:
-        from langchain_openai import ChatOpenAI
         model_id = os.getenv("GROK_MODEL", "grok-2-1212")
-        return ChatOpenAI(
-            model=model_id,
+        return OpenAICompatibleChatModel(
+            model_id=model_id,
             api_key=grok_key,
             base_url="https://api.x.ai/v1"
         )
