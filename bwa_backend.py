@@ -4,6 +4,7 @@ import operator
 import os
 import re
 import json
+import ast
 from datetime import date, timedelta
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal, Annotated
@@ -268,10 +269,21 @@ class HuggingFaceStructuredOutputWrapper:
             try:
                 return json.loads(cleaned)
             except json.JSONDecodeError:
-                raise ValueError(
-                    f"Failed to parse text as JSON. Raw model text:\n{text}\n"
-                    f"Attempted to parse clean text:\n{json_str}\nError: {e}"
-                )
+                try:
+                    python_format = json_str
+                    python_format = re.sub(r"\btrue\b", "True", python_format)
+                    python_format = re.sub(r"\bfalse\b", "False", python_format)
+                    python_format = re.sub(r"\bnull\b", "None", python_format)
+                    python_format = re.sub(r"\bTrue\b", "True", python_format)
+                    python_format = re.sub(r"\bFalse\b", "False", python_format)
+                    python_format = re.sub(r"\bNone\b", "None", python_format)
+                    return ast.literal_eval(python_format)
+                except Exception as eval_err:
+                    raise ValueError(
+                        f"Failed to parse text as JSON. Raw model text:\n{text}\n"
+                        f"Attempted to parse clean text:\n{json_str}\n"
+                        f"JSON Error: {e}\nLiteral Eval Error: {eval_err}"
+                    )
 
 
 class OpenAICompatibleChatModel:
