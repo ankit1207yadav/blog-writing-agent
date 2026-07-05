@@ -292,7 +292,25 @@ class OpenAICompatibleChatModel:
         self.llm = ChatOpenAI(model=model_id, api_key=api_key, base_url=base_url)
         
     def invoke(self, messages: list, **kwargs) -> Any:
-        return self.llm.invoke(messages, **kwargs)
+        max_retries = 8
+        retry_delay = 4.0
+        
+        for attempt in range(max_retries):
+            try:
+                return self.llm.invoke(messages, **kwargs)
+            except Exception as e:
+                err_str = str(e)
+                if "rate_limit" in err_str.lower() or "429" in err_str or "rate limit reached" in err_str.lower():
+                    wait_time = retry_delay
+                    match = re.search(r"try again in (\d+\.?\d*)s", err_str)
+                    if match:
+                        wait_time = float(match.group(1)) + 0.5
+                    
+                    print(f"Groq Rate Limit Exceeded. Waiting {wait_time:.2f} seconds before retrying (attempt {attempt+1}/{max_retries})...")
+                    time.sleep(wait_time)
+                    retry_delay *= 2.0
+                    continue
+                raise e
         
     def with_structured_output(self, schema):
         return HuggingFaceStructuredOutputWrapper(self, schema)
